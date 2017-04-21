@@ -70,7 +70,7 @@ class IOStream(BaseIOStream):
                 chunk = self.socket.recv(self.read_chunk_size)
                 if not chunk:
                     break
-                self._read_buffer.append(chunk)
+                self._read_buffer += chunk
                 self._read_buffer_size += len(chunk)
             except (socket.error, IOError, OSError) as e:
                 en = e.errno if hasattr(e, 'errno') else e.args[0]
@@ -85,7 +85,7 @@ class IOStream(BaseIOStream):
 
         if self._read_future is not None and self._read_buffer_size >= self._read_bytes:
             future, self._read_future = self._read_future, None
-            data = b"".join(self._read_buffer)
+            data = b"".join([self._read_buffer])
             self._read_buffer.clear()
             self._read_buffer_size = 0
             self._read_bytes = 0
@@ -105,7 +105,7 @@ class IOStream(BaseIOStream):
         self._read_partial = False
         if self._read_buffer_size >= self._read_bytes:
             future, self._read_future = self._read_future, None
-            data = b"".join(self._read_buffer)
+            data = b"".join([self._read_buffer])
             self._read_buffer.clear()
             self._read_buffer_size = 0
             self._read_bytes = 0
@@ -115,14 +115,24 @@ class IOStream(BaseIOStream):
     read_bytes = read
 
     def _handle_write(self):
-        while self._write_buffer:
+        while self._write_buffer_size:
+            assert self._write_buffer_size >= 0
             try:
-                data = self._write_buffer.popleft()
-                num_bytes = self.socket.send(data)
+                start = self._write_buffer_pos
+                if self._write_buffer_frozen:
+                    size = self._write_buffer_pos
+                else:
+                    size = self._write_buffer_size
+                num_bytes = self.socket.send(
+                    memoryview(self._write_buffer)[start:start+size])
+
+                self._write_buffer_pos += num_bytes
                 self._write_buffer_size -= num_bytes
-                if num_bytes < len(data):
-                    self._write_buffer.appendleft(data[num_bytes:])
-                    return
+
+                if self._write_buffer_pos > self._write_buffer_size:
+                    del self._write_buffer[:self._write_buffer_pos]
+                    self._write_buffer_pos = 0
+                return
             except (socket.error, IOError, OSError) as e:
                 en = e.errno if hasattr(e, 'errno') else e.args[0]
                 if en in _ERRNO_WOULDBLOCK:
@@ -143,12 +153,12 @@ class IOStream(BaseIOStream):
             raise StreamClosedError(real_error=self.error)
 
         if data:
-            self._write_buffer.append(data)
+            self._write_buffer += data
             self._write_buffer_size += len(data)
 
         if not self._connecting:
             self._handle_write()
-            if self._write_buffer:
+            if self._write_buffer_size:
                 if not self._state & self.io_loop.WRITE:
                     self._state = self._state | self.io_loop.WRITE
                     self.io_loop.update_handler(self.fileno(), self._state)
@@ -292,12 +302,12 @@ class Connection(_Connection):
             return self._rbuffer.read(num_bytes)
 
         if self._rbuffer_size > 0:
-            self._rfile._read_buffer.appendleft(self._rbuffer.read())
+            self._rfile._read_buffer[:0] += self._rbuffer.read()
             self._rfile._read_buffer_size += self._rbuffer_size
             self._rbuffer_size = 0
 
         if num_bytes <= self._rfile._read_buffer_size:
-            data, data_len = b''.join(self._rfile._read_buffer), self._rfile._read_buffer_size
+            data, data_len = b''.join([self._rfile._read_buffer]), self._rfile._read_buffer_size
             self._rfile._read_buffer.clear()
             self._rfile._read_buffer_size = 0
 
